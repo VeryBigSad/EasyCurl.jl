@@ -23,6 +23,15 @@ const MAX_REDIRECTIONS = 5
 const DEFAULT_CONNECT_TIMEOUT = 60  # seconds
 const DEFAULT_READ_TIMEOUT = 300  # seconds
 
+if Sys.iswindows()
+    const curl_socket_t = Base.OS_HANDLE
+    const CURL_SOCKET_TIMEOUT = Base.INVALID_OS_HANDLE
+else
+    const curl_socket_t = Cint
+    const CURL_SOCKET_TIMEOUT = -1
+end
+
+
 include("Static.jl")
 include("Utils.jl")
 
@@ -203,7 +212,7 @@ Represents an HTTP request object.
 - `rq_multi::Ptr{CURL}`: A pointer to a EasyCurl multi handle for the request.
 - `response::CurlResponse`: The HTTP response associated with this request.
 """
-struct Request
+mutable struct Request
     method::String
     url::String
     headers::Vector{Pair{String,String}}
@@ -218,7 +227,12 @@ struct Request
     rq_curl::Ptr{CURL}
     rq_multi::Ptr{CURL}
     response::CurlResponse
+    timer::Union{Nothing,Timer}
+    lock::ReentrantLock
 end
+
+# TODO: move me higher
+include("Other.jl")
 
 """
     EasyCurlStatusError{code} <: Exception
@@ -290,6 +304,25 @@ function curl_setup_rq(request::Request)
     curl_easy_setopt(request.rq_curl, CURLOPT_PROXY, something(request.proxy, C_NULL))
     curl_easy_setopt(request.rq_curl, CURLOPT_VERBOSE, request.verbose)
 
+    # curl multi setup
+    c_timer_cb =
+        @cfunction(timer_callback, Cint, (Ptr{Cvoid}, Clong, Ptr{Cvoid}))
+
+    c_curl_socket_cb =
+        @cfunction(socket_callback, Cint, (Ptr{Cvoid}, curl_socket_t, Cint, Ptr{Cvoid}))
+
+    request_p = pointer_from_objref(request)
+
+    curl_multi_setopt(request.rq_multi, CURLMOPT_TIMERFUNCTION, c_timer_cb)
+    curl_multi_setopt(request.rq_multi, CURLMOPT_TIMERDATA, request_p)
+
+    request_p2 = pointer_from_objref(request)
+
+    curl_multi_setopt(request.rq_multi, CURLMOPT_SOCKETFUNCTION, c_curl_socket_cb)
+    curl_multi_setopt(request.rq_multi, CURLMOPT_SOCKETDATA, request_p2)
+
+
+
     c_curl_write_cb =
         @cfunction(curl_write_cb, Csize_t, (Ptr{UInt8}, Csize_t, Csize_t, Ptr{Cvoid}))
 
@@ -319,11 +352,11 @@ end
 function curl_rq_handle(request::Request)
     try
         curl_multi_add_handle(request.rq_multi, request.rq_curl)
-        curl_multi_perform(request.rq_multi, request.response.curl_active)
+        curl_multi_socket_action(request.rq_multi, CURL_SOCKET_TIMEOUT, 0, request.response.curl_active)
 
         while (request.response.curl_active[1] > 0)
             rx_count_before = request.response.rx_count
-            curl_m_code = curl_multi_perform(request.rq_multi, request.response.curl_active)
+            curl_m_code = curl_multi_socket_action(request.rq_multi, CURL_SOCKET_TIMEOUT, 0, request.response.curl_active)
             rx_count_after = request.response.rx_count
             if curl_m_code != CURLE_OK
                 throw(EasyCurlError(curl_m_code, unsafe_string(curl_multi_strerror(curl_m_code))))
@@ -525,6 +558,8 @@ function request(
         rq_curl,
         curl_multi_init(),
         CurlResponse(),
+        nothing,
+        ReentrantLock()
     )
 
     return try
